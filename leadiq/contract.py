@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Union
 
 import pandas as pd
-import pandera as pa
+import pandera.pandas as pa
 from pandera.typing import Series
 
 TIMEZONE = "Asia/Kolkata"
@@ -19,7 +19,10 @@ FORBIDDEN_COLUMNS = [
     "last_contacted_at",
 ]
 
-
+IST_DTYPE = pd.DatetimeTZDtype(
+    unit="ns",
+    tz="Asia/Kolkata",
+)
 # ------------------------------------------------------------------------------
 # Pandera schemas
 # ------------------------------------------------------------------------------
@@ -31,7 +34,7 @@ LeadsSchema = pa.DataFrameSchema(
             nullable=False,
         ),
         "created_at": pa.Column(
-            pa.DateTime,
+            IST_DTYPE,
             nullable=False,
         ),
         "source": pa.Column(
@@ -79,11 +82,11 @@ LeadsSchema = pa.DataFrameSchema(
             nullable=False,
         ),
         "updated_at": pa.Column(
-            pa.DateTime,
+            IST_DTYPE,
             nullable=False,
         ),
         "last_contacted_at": pa.Column(
-            pa.DateTime,
+            IST_DTYPE,
             nullable=True,
         ),
         "legacy_score": pa.Column(
@@ -111,7 +114,7 @@ MessagesSchema = pa.DataFrameSchema(
             nullable=False,
         ),
         "sent_at": pa.Column(
-            pa.DateTime,
+            IST_DTYPE,
             nullable=False,
         ),
         "direction": pa.Column(
@@ -204,7 +207,7 @@ StageHistorySchema = pa.DataFrameSchema(
             nullable=False,
         ),
         "changed_at": pa.Column(
-            pa.DateTime,
+            IST_DTYPE,
             nullable=False,
         ),
         "changed_by": pa.Column(
@@ -236,7 +239,7 @@ CounselorsSchema = pa.DataFrameSchema(
             nullable=False,
         ),
         "joined_on": pa.Column(
-            pa.DateTime,
+            "datetime64[ns]",
             nullable=False,
         ),
     },
@@ -287,6 +290,10 @@ class LeadsInputSchema(pa.DataFrameModel):
 # ------------------------------------------------------------------------------
 # Validation helpers
 # ------------------------------------------------------------------------------
+def _ensure_ist_ns(series: pd.Series) -> pd.Series:
+    return series.astype(
+        "datetime64[ns, Asia/Kolkata]"
+    )
 
 def _assert_unique(
     df: pd.DataFrame,
@@ -330,7 +337,39 @@ def _to_integer(
 
     return numeric.astype("int64")
 
+def _normalize_ist_datetime_precision(
+    series: pd.Series,
+) -> pd.Series:
+    """
+    Normalize an already timezone-aware datetime Series to
+    Asia/Kolkata with nanosecond precision.
 
+    This makes the dtype deterministic across pandas versions,
+    including pandas versions that default to microsecond precision.
+    """
+    series = pd.to_datetime(
+        series,
+        errors="raise",
+    )
+
+    if series.dt.tz is None:
+        raise ValueError(
+            "Expected timezone-aware datetime values."
+        )
+
+    series = series.dt.tz_convert(TIMEZONE)
+
+    # Pandas 3.x may produce datetime64[us, tz].
+    # Pandera's current DateTime validation expects ns here.
+    try:
+        series = series.dt.as_unit("ns")
+    except AttributeError:
+        # Compatibility for older pandas versions.
+        series = series.astype(
+            f"datetime64[ns, {TIMEZONE}]"
+        )
+
+    return series
 # ------------------------------------------------------------------------------
 # Timestamp parsing
 # ------------------------------------------------------------------------------
@@ -340,39 +379,29 @@ def parse_ist_naive(
     tz: str = TIMEZONE,
 ) -> pd.Series:
     """
-    Parse timestamps documented by the task as:
-        local IST time with no offset.
+    Source format:
+        local IST timestamp with no offset.
 
     Example:
         2026-03-04 14:22:10
 
-    This must NOT be interpreted as UTC.
+    The source value is interpreted as IST, not UTC.
     """
-    try:
-        parsed = pd.to_datetime(
-            series,
-            errors="raise",
-        )
-    except Exception as exc:
-        raise ValueError(
-            "Failed to parse naive IST timestamp column."
-        ) from exc
+    parsed = pd.to_datetime(
+        series,
+        errors="raise",
+    )
 
-    # Source contract says these timestamps have no offset.
-    try:
-        source_tz = parsed.dt.tz
-    except AttributeError as exc:
+    if parsed.dt.tz is not None:
         raise ValueError(
-            "Expected datetime-like values for naive IST timestamp column."
-        ) from exc
-
-    if source_tz is not None:
-        raise ValueError(
-            "Expected naive IST timestamps without timezone offset, "
-            f"but found timezone '{source_tz}'."
+            "Expected naive IST timestamps without timezone offset."
         )
 
-    return parsed.dt.tz_localize(tz)
+    parsed = parsed.dt.tz_localize(tz)
+
+    return _normalize_ist_datetime_precision(
+        parsed
+    )
 
 
 def parse_utc(
@@ -380,20 +409,22 @@ def parse_utc(
     tz: str = TIMEZONE,
 ) -> pd.Series:
     """
-    Parse UTC timestamps and expose them in Asia/Kolkata.
-    """
-    try:
-        parsed = pd.to_datetime(
-            series,
-            utc=True,
-            errors="raise",
-        )
-    except Exception as exc:
-        raise ValueError(
-            "Failed to parse UTC timestamp column."
-        ) from exc
+    Source format:
+        UTC timestamp, e.g. ISO-8601 with Z.
 
-    return parsed.dt.tz_convert(tz)
+    Convert to Asia/Kolkata and normalize precision.
+    """
+    parsed = pd.to_datetime(
+        series,
+        utc=True,
+        errors="raise",
+    )
+
+    parsed = parsed.dt.tz_convert(tz)
+
+    return _normalize_ist_datetime_precision(
+        parsed
+    )
 
 
 def parse_offset_timestamp(
@@ -415,7 +446,9 @@ def parse_offset_timestamp(
             "Failed to parse offset-aware timestamp column."
         ) from exc
 
-    return parsed.dt.tz_convert(tz)
+    return _normalize_ist_datetime_precision(
+        parsed
+    )
 
 
 def convert_epoch_ms_to_tz(
@@ -423,21 +456,21 @@ def convert_epoch_ms_to_tz(
     tz: str = TIMEZONE,
 ) -> pd.Series:
     """
-    Convert Unix epoch milliseconds in UTC to Asia/Kolkata.
+    Convert Unix epoch milliseconds in UTC to Asia/Kolkata
+    and normalize precision.
     """
-    try:
-        parsed = pd.to_datetime(
-            series,
-            unit="ms",
-            utc=True,
-            errors="raise",
-        )
-    except Exception as exc:
-        raise ValueError(
-            "Failed to parse epoch-millisecond timestamp column."
-        ) from exc
+    parsed = pd.to_datetime(
+        series,
+        unit="ms",
+        utc=True,
+        errors="raise",
+    )
 
-    return parsed.dt.tz_convert(tz)
+    parsed = parsed.dt.tz_convert(tz)
+
+    return _normalize_ist_datetime_precision(
+        parsed
+    )
 
 
 # ------------------------------------------------------------------------------
@@ -449,11 +482,10 @@ def load_and_validate_leads(
 ) -> pd.DataFrame:
     df = pd.read_csv(filepath)
 
-    df["age"] = _to_integer(
+    df["age"] = pd.to_numeric(
         df["age"],
-        "age",
-        allow_null=True,
-    )
+        errors="raise"
+    ).astype("Int64")
 
     df["legacy_score"] = _to_integer(
         df["legacy_score"],
@@ -546,10 +578,28 @@ def load_and_validate_counselors(
 ) -> pd.DataFrame:
     df = pd.read_csv(filepath)
 
-    df["joined_on"] = pd.to_datetime(
+    parsed = pd.to_datetime(
         df["joined_on"],
         errors="raise",
     )
+
+    # joined_on is documented as a DATE, not a timestamp.
+    # It must remain timezone-naive.
+    if getattr(parsed.dt, "tz", None) is not None:
+        raise ValueError(
+            "counselors.csv: joined_on must be timezone-naive."
+        )
+
+    # Normalize pandas 3.x microsecond precision to ns
+    # for deterministic Pandera validation.
+    try:
+        parsed = parsed.dt.as_unit("ns")
+    except AttributeError:
+        parsed = parsed.astype(
+            "datetime64[ns]"
+        )
+
+    df["joined_on"] = parsed
 
     return CounselorsSchema.validate(df)
 
