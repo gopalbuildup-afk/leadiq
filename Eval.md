@@ -106,3 +106,33 @@ python -m leadiq.train `
   --export-date "2026-09-15 23:59:00+05:30" `
   --lightgbm-trials 20
 ```
+
+## 5. M3: Text Embeddings Evaluation
+
+### With-Text vs. Without-Text Ablation
+
+The final validation set was kept frozen and was not used for tuning the M3 representation.
+
+| Model | PR-AUC | ROC-AUC | Lift@10% | Lift@20% | Recall@10% | Recall@20% |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Without text | 0.2816 | 0.7597 | 3.4442 | 2.3918 | 0.3462 | 0.4808 |
+| With text | 0.2091 | 0.7522 | 3.4442 | 2.3918 | 0.3462 | 0.4808 |
+
+The frozen validation ablation did not show an improvement from adding the text embedding features. PR-AUC decreased from 0.2816 to 0.2091, while ROC-AUC also decreased slightly. Lift and recall at the 10% and 20% operating points were unchanged.
+
+### M3 Reproduction
+
+Run the following command from the repository root:
+
+```powershell
+python -m leadiq.m3_ablation `
+  --leads data/leads.csv `
+  --messages data/messages.csv `
+  --calls data/calls.csv `
+  --stages data/stage_history.csv `
+  --localities data/localities.csv `
+  --export-date "2026-09-15 23:59:00+05:30" `
+  --model-dir artifacts/m2 `
+  --output-dir artifacts/m3
+```
+

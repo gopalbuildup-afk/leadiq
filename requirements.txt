@@ -5,3 +5,8 @@ pandera
 scikit-learn
 matplotlib
 lightgbm
+psycopg[binary]
+sentence-transformers
+python-dotenv
+fastapi
+uvicorn
