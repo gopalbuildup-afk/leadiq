@@ -814,6 +814,7 @@ def build_feature_matrix(
     calls_df: pd.DataFrame,
     localities_df: pd.DataFrame,
     fill_latency_nans: bool = True,
+    m4_features: Optional[pd.DataFrame] = None,
 ) -> pd.DataFrame:
     """
     Build the point-in-time feature matrix.
@@ -944,6 +945,43 @@ def build_feature_matrix(
         localities_df,
     )
 
+    if m4_features is not None:
+        required_m4 = {"earlier_enquiries_count"}
+        missing_m4 = required_m4 - set(m4_features.columns)
+        if missing_m4:
+            raise ValueError(
+                "M4 feature block is missing required columns: "
+                f"{sorted(missing_m4)}"
+            )
+
+        m4_block = m4_features.copy()
+        if m4_block.index.name != "lead_id":
+            if "lead_id" in m4_block.columns:
+                m4_block = m4_block.set_index("lead_id")
+            else:
+                raise ValueError(
+                    "M4 feature block must use lead_id as its index "
+                    "or contain a lead_id column."
+                )
+
+        m4_block.index = m4_block.index.astype(str)
+
+        if m4_block.index.duplicated().any():
+            raise ValueError("M4 feature block contains duplicate lead_id values.")
+
+        if not clean_leads["lead_id"].astype(str).isin(m4_block.index).all():
+            missing_ids = clean_leads.loc[
+                ~clean_leads["lead_id"].astype(str).isin(m4_block.index),
+                "lead_id",
+            ].head(10).tolist()
+            raise ValueError(
+                "M4 feature block is missing leads. "
+                f"Examples: {missing_ids}"
+            )
+
+        m4_block = m4_block.reindex(clean_leads["lead_id"].astype(str))
+        m4_block.index = clean_leads["lead_id"].values
+
     # ------------------------------------------------------------------
     # Merge feature blocks
     # ------------------------------------------------------------------
@@ -971,6 +1009,18 @@ def build_feature_matrix(
         how="left",
         validate="one_to_one",
     )
+
+    if m4_features is not None:
+        m4_merge = m4_block.reset_index().rename(
+            columns={"index": "lead_id"}
+        )
+        df = pd.merge(
+            df,
+            m4_merge,
+            on="lead_id",
+            how="left",
+            validate="one_to_one",
+        )
 
     # ------------------------------------------------------------------
     # Remove metadata / PII

@@ -14,6 +14,7 @@ from .contract import (
     load_and_validate_stage_history,
 )
 from .features import build_feature_matrix
+from .m4_features import build_earlier_enquiries_feature
 from .split import TimeSplit, build_time_split
 
 
@@ -36,15 +37,14 @@ def load_m2_dataset(
     hidden_start: str | pd.Timestamp = "2026-07-05 00:00:00+05:30",
     validation_weeks: int = 4,
     calibration_fraction: float = 0.20,
+    lead_clusters_path: str | Path | None = None,
 ) -> M2Dataset:
-    """Load M1 data, build mature labels + features, then make M2 split."""
+    """Load M1 data, optionally add the M4 earlier-enquiries feature, then split for M2."""
     leads = load_and_validate_leads(str(leads_path))
     messages = load_and_validate_messages(str(messages_path))
     calls = load_and_validate_calls(str(calls_path))
     localities = load_and_validate_localities(str(localities_path))
-    stages = load_and_validate_stage_history(
-    str(stages_path)
-)
+    stages = load_and_validate_stage_history(str(stages_path))
 
     labels = compute_target_and_maturity(
         leads_df=leads,
@@ -56,12 +56,27 @@ def load_m2_dataset(
     mature_ids = pd.Index(labels["lead_id"])
     mature_leads = leads[leads["lead_id"].isin(mature_ids)].copy()
 
+    m4_features = None
+    if lead_clusters_path is not None:
+        cluster_path = Path(lead_clusters_path)
+        if not cluster_path.exists():
+            raise FileNotFoundError(
+                f"M4 lead cluster file not found: {cluster_path}"
+            )
+
+        lead_clusters = pd.read_csv(cluster_path)
+        m4_features = build_earlier_enquiries_feature(
+            leads_df=mature_leads,
+            lead_clusters=lead_clusters,
+        )
+
     # Preserve raw rows for point-in-time feature construction.
     X = build_feature_matrix(
         mature_leads,
         messages[messages["lead_id"].isin(mature_ids)].copy(),
         calls[calls["lead_id"].isin(mature_ids)].copy(),
         localities,
+        m4_features=m4_features,
     )
 
     y = labels.set_index("lead_id")["target"].reindex(X.index)
