@@ -354,6 +354,7 @@ def run_training(args: argparse.Namespace) -> dict[str, Any]:
         hidden_start=args.hidden_start,
         validation_weeks=args.validation_weeks,
         calibration_fraction=args.calibration_fraction,
+        lead_clusters_path=args.lead_clusters,
     )
 
     X = dataset.X
@@ -607,6 +608,11 @@ def main() -> None:
         "--calibration-method",
         choices=["platt", "isotonic"],
         default="platt",
+    )
+    parser.add_argument(
+        "--lead-clusters",
+        default="artifacts/m4/lead_clusters.csv",
+        help="M4 lead_clusters.csv used to build earlier_enquiries_count.",
     )
     parser.add_argument(
         "--lightgbm-trials",
