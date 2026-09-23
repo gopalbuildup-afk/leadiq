@@ -94,3 +94,13 @@
 | `stage_history.csv` | `changed_at` | `2026-04-09T06:36:51+05:30` | Asia/Kolkata (+05:30 offset) | `YYYY-MM-DDTHH:MM:SS+05:30` |
 
 **Conclusion:** No. The timestamps do not use a consistent timezone or format.
+
+
+
+
+## Required setup (5 commands or fewer)
+1. `pip install -r requirements.txt`
+2. `python scripts/setup_module5_db.py`
+3. `python -m leadiq.train --leads ... --messages ... --calls ... --stages ... --localities ... --export-date ... --output-dir artifacts/m2`
+4. `python scripts/setup_module5_db.py --check`
+5. Start API or run batch CLI
