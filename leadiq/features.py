@@ -1021,6 +1021,8 @@ def build_feature_matrix(
             how="left",
             validate="one_to_one",
         )
+    else:
+        df["earlier_enquiries_count"] = 0
 
     # ------------------------------------------------------------------
     # Remove metadata / PII
