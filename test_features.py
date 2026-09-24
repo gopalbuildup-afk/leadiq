@@ -1,10 +1,16 @@
 import pandas as pd
+from leadiq.contract import (
+    load_and_validate_leads,
+    load_and_validate_messages,
+    load_and_validate_calls,
+    load_and_validate_localities,
+)
 from leadiq.features import build_feature_matrix, FORBIDDEN_COLUMNS
 
-leads = pd.read_csv("data/leads.csv")
-msgs = pd.read_csv("data/messages.csv")
-calls = pd.read_csv("data/calls.csv")
-locs = pd.read_csv("data/localities.csv")
+leads = load_and_validate_leads("data/leads.csv")
+msgs = load_and_validate_messages("data/messages.csv")
+calls = load_and_validate_calls("data/calls.csv")
+locs = load_and_validate_localities("data/localities.csv")
 
 clean_leads = leads.drop(
     columns=[

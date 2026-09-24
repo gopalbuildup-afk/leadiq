@@ -480,6 +480,9 @@ def convert_epoch_ms_to_tz(
 def load_and_validate_leads(
     filepath: str,
 ) -> pd.DataFrame:
+    import os
+    if not os.path.exists(filepath):
+        return load_and_validate_leads_from_db()
     df = pd.read_csv(filepath)
 
     df["age"] = pd.to_numeric(
@@ -511,9 +514,38 @@ def load_and_validate_leads(
     return validated
 
 
+def load_and_validate_leads_from_db() -> pd.DataFrame:
+    from leadiq.versioning import _pool_instance
+    pool = _pool_instance()
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT lead_id, created_at, source, branch, course_interest, full_name,
+                       phone, email, education_status, age, home_locality, assigned_counselor_id,
+                       current_stage, updated_at, last_contacted_at, legacy_score, legacy_score_version
+                FROM leads
+            """)
+            rows = cur.fetchall()
+            cols = [d[0] for d in cur.description]
+            df = pd.DataFrame(rows, columns=cols)
+
+    df["age"] = pd.to_numeric(df["age"], errors="coerce").astype("Int64")
+    df["legacy_score"] = _to_integer(df["legacy_score"], "legacy_score", allow_null=True)
+    for col in ["created_at", "updated_at", "last_contacted_at"]:
+        if col in df.columns:
+            df[col] = parse_offset_timestamp(df[col])
+
+    validated = LeadsSchema.validate(df)
+    _assert_unique(validated, "lead_id", "leads table")
+    return validated
+
+
 def load_and_validate_messages(
     filepath: str,
 ) -> pd.DataFrame:
+    import os
+    if not os.path.exists(filepath):
+        return load_and_validate_messages_from_db()
     df = pd.read_csv(filepath)
 
     df["sent_at"] = parse_utc(df["sent_at"])
@@ -529,9 +561,28 @@ def load_and_validate_messages(
     return validated
 
 
+def load_and_validate_messages_from_db() -> pd.DataFrame:
+    from leadiq.versioning import _pool_instance
+    pool = _pool_instance()
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT message_id, lead_id, sent_at, direction, sender_type, text FROM messages")
+            rows = cur.fetchall()
+            cols = [d[0] for d in cur.description]
+            df = pd.DataFrame(rows, columns=cols)
+
+    df["sent_at"] = parse_offset_timestamp(df["sent_at"])
+    validated = MessagesSchema.validate(df)
+    _assert_unique(validated, "message_id", "messages table")
+    return validated
+
+
 def load_and_validate_calls(
     filepath: str,
 ) -> pd.DataFrame:
+    import os
+    if not os.path.exists(filepath):
+        return load_and_validate_calls_from_db()
     df = pd.read_csv(filepath)
 
     df["started_at_ms"] = _to_integer(
@@ -563,13 +614,48 @@ def load_and_validate_calls(
     return validated
 
 
+def load_and_validate_calls_from_db() -> pd.DataFrame:
+    from leadiq.versioning import _pool_instance
+    pool = _pool_instance()
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT call_id, lead_id, counselor_id, started_at_ms, duration_sec, outcome, notes FROM calls")
+            rows = cur.fetchall()
+            cols = [d[0] for d in cur.description]
+            df = pd.DataFrame(rows, columns=cols)
+
+    df["started_at_ms"] = _to_integer(df["started_at_ms"], "started_at_ms", allow_null=False)
+    df["duration_sec"] = _to_integer(df["duration_sec"], "duration_sec", allow_null=False)
+    validated = CallsSchema.validate(df)
+    _assert_unique(validated, "call_id", "calls table")
+    validated["started_at"] = convert_epoch_ms_to_tz(validated["started_at_ms"])
+    return validated
+
+
 def load_and_validate_stage_history(
     filepath: str,
 ) -> pd.DataFrame:
+    import os
+    if not os.path.exists(filepath):
+        return load_and_validate_stage_history_from_db()
     df = pd.read_csv(filepath)
 
     df["changed_at"] = parse_offset_timestamp(df["changed_at"])
 
+    return StageHistorySchema.validate(df)
+
+
+def load_and_validate_stage_history_from_db() -> pd.DataFrame:
+    from leadiq.versioning import _pool_instance
+    pool = _pool_instance()
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT lead_id, stage, changed_at, changed_by FROM stage_history")
+            rows = cur.fetchall()
+            cols = [d[0] for d in cur.description]
+            df = pd.DataFrame(rows, columns=cols)
+
+    df["changed_at"] = parse_offset_timestamp(df["changed_at"])
     return StageHistorySchema.validate(df)
 
 
@@ -607,6 +693,9 @@ def load_and_validate_counselors(
 def load_and_validate_localities(
     filepath: str,
 ) -> pd.DataFrame:
+    import os
+    if not os.path.exists(filepath):
+        return load_and_validate_localities_from_db()
     df = pd.read_csv(filepath)
 
     for column in [
@@ -618,6 +707,22 @@ def load_and_validate_localities(
             df[column],
             errors="raise",
         ).astype(float)
+
+    return LocalitiesSchema.validate(df)
+
+
+def load_and_validate_localities_from_db() -> pd.DataFrame:
+    from leadiq.versioning import _pool_instance
+    pool = _pool_instance()
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT locality, km_to_riverside, km_to_central, km_to_lakeview FROM localities")
+            rows = cur.fetchall()
+            cols = [d[0] for d in cur.description]
+            df = pd.DataFrame(rows, columns=cols)
+
+    for column in ["km_to_riverside", "km_to_central", "km_to_lakeview"]:
+        df[column] = pd.to_numeric(df[column], errors="raise").astype(float)
 
     return LocalitiesSchema.validate(df)
 

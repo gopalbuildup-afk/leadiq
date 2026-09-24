@@ -60,29 +60,29 @@ class SimilarLeadsResponse(BaseModel):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # No heavyweight M3 model is loaded at API startup.
-    # Embeddings already exist in pgvector.
-    # Warm the Module 5 caches (DB pool + schema, model bundle, scoring
-    # CSVs, M4 features) so the first UI request is served fast instead
-    # of paying the whole cold start. Best-effort: requests lazily
-    # initialise anything missed here.
-    try:
-        from .score import (
-            _ensure_schema_once,
-            _get_bundle,
-            _get_frames,
-            _get_m4_features,
-        )
-        from leadiq.versioning import _pool_instance
+    # Non-blocking background warming task so uvicorn starts immediately
+    import asyncio
 
-        _ensure_schema_once()
-        with _pool_instance().connection():
+    def _sync_warm():
+        try:
+            from .score import (
+                _ensure_schema_once,
+                _get_bundle,
+                _get_frames,
+                _get_m4_features,
+            )
+            from leadiq.versioning import _pool_instance
+
+            _ensure_schema_once()
+            with _pool_instance().connection():
+                pass
+            _get_bundle()
+            frames = _get_frames()
+            _get_m4_features(frames["leads"])
+        except Exception:
             pass
-        _get_bundle()
-        frames = _get_frames()
-        _get_m4_features(frames["leads"])
-    except Exception:
-        pass
+
+    asyncio.create_task(asyncio.to_thread(_sync_warm))
     yield
 
 

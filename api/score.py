@@ -167,20 +167,42 @@ def _get_m4_features(leads: pd.DataFrame) -> pd.DataFrame | None:
                         build_earlier_enquiries_feature,
                     )
 
+                    cluster_df = None
                     clusters_path = os.path.join(
                         _project_root(), "artifacts", "m4", "lead_clusters.csv"
                     )
                     if os.path.exists(clusters_path):
                         cluster_df = pd.read_csv(clusters_path)
-                        if (
-                            "lead_id" in cluster_df.columns
-                            and "cluster_id" in cluster_df.columns
-                        ):
-                            _m4_features = build_earlier_enquiries_feature(
-                                leads, cluster_df
-                            )
+                    else:
+                        try:
+                            from leadiq.versioning import _pool_instance
+                            with _pool_instance().connection() as conn:
+                                with conn.cursor() as cur:
+                                    cur.execute("SELECT cluster_id, lead_id, is_canonical FROM lead_clusters")
+                                    rows = cur.fetchall()
+                                    if rows:
+                                        cluster_df = pd.DataFrame(rows, columns=["cluster_id", "lead_id", "is_canonical"])
+                        except Exception:
+                            cluster_df = None
+
+                    if (
+                        cluster_df is not None
+                        and "lead_id" in cluster_df.columns
+                        and "cluster_id" in cluster_df.columns
+                    ):
+                        _m4_features = build_earlier_enquiries_feature(
+                            leads, cluster_df
+                        )
                 except Exception:
                     _m4_features = None
+
+    if _m4_features is None and leads is not None and not leads.empty:
+        df_default = pd.DataFrame({
+            "lead_id": leads["lead_id"].astype(str),
+            "earlier_enquiries_count": 0
+        }).set_index("lead_id")
+        return df_default
+
     return _m4_features
 
 
