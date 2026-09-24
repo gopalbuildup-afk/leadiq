@@ -10,3 +10,4 @@ psycopg[binary,pool]
 python-dotenv
 joblib
 onnxruntime
+pandera
