@@ -17,4 +17,7 @@ services:
     staticPublishPath: ./dist
     envVars:
       - key: VITE_LEADIQ_API_URL
-        sync: false
+        fromService:
+          name: leadiq-backend
+          type: web
+          envVarKey: RENDER_EXTERNAL_URL
