@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import os
+import time
+import logging
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -26,9 +28,11 @@ from .score import (
     ScoreRequest,
     ModelCardResponse,
     score_single_lead,
+    score_many_leads,
     get_model_card_api,
     healthz_api,
 )
+from .leads import router as leads_router
 
 
 # ---------------------------------------------------------------------
@@ -58,6 +62,27 @@ class SimilarLeadsResponse(BaseModel):
 async def lifespan(app: FastAPI):
     # No heavyweight M3 model is loaded at API startup.
     # Embeddings already exist in pgvector.
+    # Warm the Module 5 caches (DB pool + schema, model bundle, scoring
+    # CSVs, M4 features) so the first UI request is served fast instead
+    # of paying the whole cold start. Best-effort: requests lazily
+    # initialise anything missed here.
+    try:
+        from .score import (
+            _ensure_schema_once,
+            _get_bundle,
+            _get_frames,
+            _get_m4_features,
+        )
+        from leadiq.versioning import _pool_instance
+
+        _ensure_schema_once()
+        with _pool_instance().connection():
+            pass
+        _get_bundle()
+        frames = _get_frames()
+        _get_m4_features(frames["leads"])
+    except Exception:
+        pass
     yield
 
 
@@ -94,6 +119,37 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+app.include_router(leads_router)
+
+
+# ---------------------------------------------------------------------
+# Request log: one line per call with status + duration, so the backend
+# terminal visibly shows every request the frontend makes.
+# ---------------------------------------------------------------------
+
+_api_logger = logging.getLogger("leadiq.api")
+if not _api_logger.handlers:
+    _handler = logging.StreamHandler()
+    _handler.setFormatter(logging.Formatter("INFO: %(message)s"))
+    _api_logger.addHandler(_handler)
+_api_logger.setLevel(logging.INFO)
+_api_logger.propagate = False
+
+
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    start = time.perf_counter()
+    response = await call_next(request)
+    elapsed_ms = (time.perf_counter() - start) * 1000
+    _api_logger.info(
+        "%s %s -> %s (%.0f ms)",
+        request.method,
+        request.url.path,
+        response.status_code,
+        elapsed_ms,
+    )
+    return response
 
 
 # ---------------------------------------------------------------------
@@ -172,30 +228,31 @@ def score_batch(
             detail="Maximum 500 leads per batch request.",
         )
 
-    results = []
-    for lead_id in request.lead_ids:
-        try:
-            result = score_single_lead(lead_id)
-            results.append(ScoreResponse(
-                lead_id=result["lead_id"],
-                asof=result["asof"],
-                probability=result["probability"],
-                band=result["band"],
-                reasons=[
-                    {"en": r["en"], "hi": r["hi"]} for r in result["reasons"]
-                ],
-                model_version=result["model_version"],
-                duplicate_cluster_size=result["duplicate_cluster_size"],
-            ))
-        except HTTPException as exc:
-            if exc.status_code == 404:
-                raise HTTPException(
-                    status_code=404,
-                    detail=f"Lead {lead_id} not found",
-                ) from exc
-            raise
+    try:
+        results = score_many_leads(request.lead_ids)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
-    return BatchScoreResponse(results=results, count=len(results))
+    return BatchScoreResponse(
+        results=[
+            ScoreResponse(
+                lead_id=r["lead_id"],
+                asof=r["asof"],
+                probability=r["probability"],
+                band=r["band"],
+                reasons=[
+                    {"en": reason["en"], "hi": reason["hi"]}
+                    for reason in r["reasons"]
+                ],
+                model_version=r["model_version"],
+                duplicate_cluster_size=r["duplicate_cluster_size"],
+            )
+            for r in results
+        ],
+        count=len(results),
+    )
 
 
 # ---------------------------------------------------------------------

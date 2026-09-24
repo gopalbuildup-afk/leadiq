@@ -5,8 +5,11 @@ pandera
 scikit-learn
 matplotlib
 lightgbm
-psycopg[binary]
+psycopg[binary,pool]
 sentence-transformers
+onnx
+onnxruntime
+onnxscript
 shap
 python-dotenv
 fastapi

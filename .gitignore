@@ -22,3 +22,5 @@ scripts/setup_module5_db.py
 scripts/populate_lead_clusters.py
 tests/test_real_data_contract.py
 tests/test_real_m1_pipeline.py
+verify_onnx_parity.py
+export_m3_onnx.py

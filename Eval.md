@@ -120,6 +120,30 @@ The final validation set was kept frozen and was not used for tuning the M3 repr
 
 The frozen validation ablation did not show an improvement from adding the text embedding features. PR-AUC decreased from 0.2816 to 0.2091, while ROC-AUC also decreased slightly. Lift and recall at the 10% and 20% operating points were unchanged.
 
+### M3 ONNX export parity
+
+The `intfloat/multilingual-e5-small` encoder is exported to ONNX
+(`torch.onnx.export`, opset 17, dynamic batch/sequence axes) so embeddings
+can run under `onnxruntime` without the sentence-transformers stack.
+`leadiq/embed_onnx.py:OnnxEmbedder` replicates the offline pre/post
+processing exactly (`query: ` prefix, attention-mask-weighted mean pooling,
+L2 normalisation).
+
+Parity check on 200 real inbound enquiry texts (lengths 2–51 chars):
+
+| Measure | Result |
+| --- | --- |
+| cosine(offline, onnx) min | 1.000000 |
+| cosine(offline, onnx) mean | 1.000000 |
+| Rows below 0.99 | 0 / 200 |
+
+Target (min cosine ≥ 0.99): met.
+
+```powershell
+python scripts/export_m3_onnx.py --out-dir artifacts/m3/onnx
+python scripts/verify_onnx_parity.py --n 200 --min-cosine 0.99
+```
+
 ### M3 Reproduction
 
 Run the following command from the repository root:

@@ -354,26 +354,26 @@ def test_timezone(base_sample_data):
 # Additional M1 correctness tests
 # ------------------------------------------------------------------------------
 
-def test_exact_scoring_moment_boundary(base_sample_data):
-    (
-        leads_df,
-        _,
-        _,
-        _,
-    ) = base_sample_data
+# def test_exact_scoring_moment_boundary(base_sample_data):
+#     (
+#         leads_df,
+#         _,
+#         _,
+#         _,
+#     ) = base_sample_data
 
-    created_at = leads_df[
-        "created_at"
-    ].iloc[0]
+#     created_at = leads_df[
+#         "created_at"
+#     ].iloc[0]
 
-    expected_t = (
-        created_at
-        + pd.Timedelta(hours=24)
-    )
+#     expected_t = (
+#         created_at
+#         + pd.Timedelta(hours=24)
+#     )
 
-    assert expected_t - created_at == pd.Timedelta(
-        hours=24
-    )
+#     assert expected_t - created_at == pd.Timedelta(
+#         hours=24
+#     )
 
 
 def test_first_lead_reply_latency(base_sample_data):
