@@ -1,8 +1,13 @@
 from __future__ import annotations
 
 import os
+import sys
 import time
 import logging
+
+_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _root not in sys.path:
+    sys.path.insert(0, _root)
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Query, Request

@@ -1,0 +1,7 @@
+-r requirements.txt
+sentence-transformers
+onnx
+onnxruntime
+onnxscript
+matplotlib
+pandera
