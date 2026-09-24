@@ -6,13 +6,13 @@ from pathlib import Path
 import joblib
 import numpy as np
 import pandas as pd
-import shap
 
 from .model_data import load_m2_dataset
 from .reasons import reason_for_feature
 
 
 def _get_shap_values(model, X_transformed):
+    import shap
     explainer = shap.TreeExplainer(model)
     dense = X_transformed.toarray() if hasattr(X_transformed, "toarray") else np.asarray(X_transformed)
     try:
