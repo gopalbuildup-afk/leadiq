@@ -1,16 +1,19 @@
 from __future__ import annotations
 
 import os
+import threading
+import time
+import logging
 from datetime import datetime, timezone
 from typing import Any, Optional
 
 import joblib
 import numpy as np
 import pandas as pd
-import psycopg
 from fastapi import HTTPException
 from pydantic import BaseModel, Field
 
+from leadiq.calibration import assign_band
 from leadiq.contract import (
     load_and_validate_calls,
     load_and_validate_leads,
@@ -18,13 +21,13 @@ from leadiq.contract import (
     load_and_validate_messages,
 )
 from leadiq.features import build_feature_matrix
-from leadiq.score import _compute_asof
+from leadiq.score import _compute_asof, _compute_reasons_batch
 from leadiq.versioning import (
+    enqueue_scores,
     get_champion_version,
     get_model_card,
-    get_duplicate_cluster_size,
     initialise_schema,
-    append_lead_scores,
+    lookup_sizes,
 )
 
 
@@ -70,114 +73,127 @@ class ModelCardResponse(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Database helpers for single-lead scoring
+# Process-level caches.
+#
+# Scoring the call list fires hundreds of scores per minute. Reloading the
+# model bundle and re-validating every CSV from disk on each request made a
+# 500-lead batch take the better part of an hour. Everything below is loaded
+# once per API worker process and reused; the underlying files only change
+# when a module is re-run, which also restarts the API.
 # ---------------------------------------------------------------------------
 
-def _database_url() -> str:
-    database_url = os.getenv("DATABASE_URL")
-    if not database_url:
-        raise RuntimeError("DATABASE_URL is not set.")
-    return database_url
+_init_lock = threading.Lock()
+_schema_ready = False
+_bundle: dict | None = None
+_frames: dict[str, pd.DataFrame] | None = None
+_m4_features: pd.DataFrame | None = None
+_m4_attempted = False
+
+_api_log = logging.getLogger("leadiq.api")
 
 
-def _get_lead_data(lead_id: str) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    Fetch a single lead's raw data and build the feature matrix.
-    """
-    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    leads_path = os.path.join(project_root, "data", "leads.csv")
-    messages_path = os.path.join(project_root, "data", "messages.csv")
-    calls_path = os.path.join(project_root, "data", "calls.csv")
-    localities_path = os.path.join(project_root, "data", "localities.csv")
-    clusters_path = os.path.join(project_root, "artifacts", "m4", "lead_clusters.csv")
-
-    try:
-        from leadiq.contract import (
-            load_and_validate_calls,
-            load_and_validate_leads,
-            load_and_validate_localities,
-            load_and_validate_messages,
-        )
-        from leadiq.m4_features import build_earlier_enquiries_feature
-
-        leads = load_and_validate_leads(leads_path)
-        messages = load_and_validate_messages(messages_path)
-        calls = load_and_validate_calls(calls_path)
-        localities = load_and_validate_localities(localities_path)
-
-        if lead_id not in leads["lead_id"].values:
-            raise HTTPException(status_code=404, detail=f"Lead {lead_id} not found")
-
-        leads_filtered = leads[leads["lead_id"] == lead_id]
-        messages_filtered = messages[messages["lead_id"] == lead_id]
-        calls_filtered = calls[calls["lead_id"] == lead_id]
-
-        # Load M4 clusters for earlier_enquiries_count feature
-        m4_features = None
-        if os.path.exists(clusters_path):
-            try:
-                import pandas as pd
-                cluster_df = pd.read_csv(clusters_path)
-                if "lead_id" in cluster_df.columns and "cluster_id" in cluster_df.columns:
-                    m4_features = build_earlier_enquiries_feature(leads_filtered, cluster_df)
-            except Exception:
-                pass
-
-        # Build feature matrix for the single lead
-        X = build_feature_matrix(
-            leads_df=leads_filtered,
-            messages_df=messages_filtered,
-            calls_df=calls_filtered,
-            localities_df=localities,
-            m4_features=m4_features,
-        )
-
-        return X, leads_filtered
-
-    except HTTPException:
-        raise
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+def _project_root() -> str:
+    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
-def _load_bundle() -> dict:
-    """Load the model bundle from artifacts."""
-    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    model_path = os.path.join(project_root, "artifacts", "m2", "model_bundle.joblib")
-    if not os.path.exists(model_path):
-        raise HTTPException(status_code=503, detail="Model bundle not found. Train M2 first.")
-    return joblib.load(model_path)
+def _ensure_schema_once() -> None:
+    """Create Module 5 tables on first use only (DDL per request is slow)."""
+    global _schema_ready
+    if _schema_ready:
+        return
+    with _init_lock:
+        if _schema_ready:
+            return
+        try:
+            initialise_schema()
+        except Exception:
+            pass
+        _schema_ready = True
 
 
-def _generate_lead_reasons(
-    model,
-    preprocessor,
-    X_row: pd.Series,
-    x_transformed_row: np.ndarray,
-    feature_names: list[str],
-) -> list[dict[str, str]]:
-    """Generate top-3 reasons for a single lead."""
-    from leadiq.score import _get_top_3_reasons
-    return _get_top_3_reasons(
-        model, preprocessor, X_row, x_transformed_row, feature_names
-    )
+def _get_bundle() -> dict:
+    """Load the M2 model bundle once per process."""
+    global _bundle
+    if _bundle is None:
+        with _init_lock:
+            if _bundle is None:
+                model_path = os.path.join(
+                    _project_root(), "artifacts", "m2", "model_bundle.joblib"
+                )
+                if not os.path.exists(model_path):
+                    raise HTTPException(
+                        status_code=503,
+                        detail="Model bundle not found. Train M2 first.",
+                    )
+                _bundle = joblib.load(model_path)
+    assert _bundle is not None
+    return _bundle
 
 
-def score_single_lead(lead_id: str) -> dict[str, Any]:
-    """Score a single enquiry and return the response dict."""
-    # Ensure schema exists
-    try:
-        initialise_schema()
-    except Exception:
-        pass
+def _get_frames() -> dict[str, pd.DataFrame]:
+    """Load and validate the scoring CSVs once per process."""
+    global _frames
+    if _frames is None:
+        with _init_lock:
+            if _frames is None:
+                root = _project_root()
+                _frames = {
+                    "leads": load_and_validate_leads(
+                        os.path.join(root, "data", "leads.csv")
+                    ),
+                    "messages": load_and_validate_messages(
+                        os.path.join(root, "data", "messages.csv")
+                    ),
+                    "calls": load_and_validate_calls(
+                        os.path.join(root, "data", "calls.csv")
+                    ),
+                    "localities": load_and_validate_localities(
+                        os.path.join(root, "data", "localities.csv")
+                    ),
+                }
+    assert _frames is not None
+    return _frames
 
-    # Load bundle and data
-    bundle = _load_bundle()
-    X, leads_filtered = _get_lead_data(lead_id)
 
-    if X.empty:
-        raise HTTPException(status_code=404, detail=f"No features for lead {lead_id}")
+def _get_m4_features(leads: pd.DataFrame) -> pd.DataFrame | None:
+    """Build the earlier-enquiries feature over the full lead set, once."""
+    global _m4_features, _m4_attempted
+    if not _m4_attempted:
+        with _init_lock:
+            if not _m4_attempted:
+                _m4_attempted = True
+                try:
+                    from leadiq.m4_features import (
+                        build_earlier_enquiries_feature,
+                    )
 
+                    clusters_path = os.path.join(
+                        _project_root(), "artifacts", "m4", "lead_clusters.csv"
+                    )
+                    if os.path.exists(clusters_path):
+                        cluster_df = pd.read_csv(clusters_path)
+                        if (
+                            "lead_id" in cluster_df.columns
+                            and "cluster_id" in cluster_df.columns
+                        ):
+                            _m4_features = build_earlier_enquiries_feature(
+                                leads, cluster_df
+                            )
+                except Exception:
+                    _m4_features = None
+    return _m4_features
+
+
+# ---------------------------------------------------------------------------
+# Shared scoring core: one feature matrix -> one predict -> one batch SHAP.
+# ---------------------------------------------------------------------------
+
+def _score_frame(
+    X: pd.DataFrame,
+    leads_filtered: pd.DataFrame,
+    bundle: dict,
+) -> list[dict[str, Any]]:
+    """Pure compute: no DB. Cluster sizes resolve separately in one checkout."""
     preprocessor = bundle["preprocessor"]
     champion_model = bundle["champion_model"]
     calibrator = bundle["calibrator"]
@@ -185,70 +201,179 @@ def score_single_lead(lead_id: str) -> dict[str, Any]:
 
     X_transformed = preprocessor.transform(X)
     raw_probability = champion_model.predict_proba(X_transformed)[:, 1]
-    calibrated_probability = np.clip(
+    calibrated = np.clip(
         np.asarray(calibrator.predict(raw_probability), dtype=float),
-        0.0, 1.0,
+        0.0,
+        1.0,
     )
-
-    # Assign bands
-    bands = []
-    for p in calibrated_probability:
-        if p >= thresholds["p1_min_probability"]:
-            bands.append("P1")
-        elif p >= thresholds["p2_min_probability"]:
-            bands.append("P2")
-        else:
-            bands.append("P3")
-
+    bands = assign_band(calibrated, thresholds)
     feature_names = list(preprocessor.get_feature_names_out())
-    lead_str = str(lead_id)
-
-    # Get reasons
-    x_row = X.iloc[0]
-    x_transformed_row = X_transformed[0]
-    reasons = _generate_lead_reasons(
-        champion_model, preprocessor, x_row, x_transformed_row, feature_names
+    reasons_list = _compute_reasons_batch(
+        champion_model, preprocessor, X, X_transformed, feature_names
     )
 
-    # Get duplicate cluster size
-    try:
-        cluster_size = get_duplicate_cluster_size(lead_str)
-    except Exception:
-        cluster_size = 1
+    leads_by_id = leads_filtered.set_index("lead_id")
+    results: list[dict[str, Any]] = []
+    for i, lead_id in enumerate(X.index):
+        lead_str = str(lead_id)
+        asof = _compute_asof(leads_by_id.loc[lead_str, "created_at"])
+        results.append(
+            {
+                "lead_id": lead_str,
+                "asof": asof.isoformat(),
+                "probability": float(calibrated[i]),
+                "band": str(bands[i]),
+                "reasons": reasons_list[i],
+                "model_version": bundle["version"],
+                # Placeholder; resolved from lead_clusters in the same
+                # checkout as the append (see _resolve_and_persist).
+                "duplicate_cluster_size": 1,
+            }
+        )
+    return results
 
-    # Compute asof
-    created_at = leads_filtered.iloc[0]["created_at"]
-    asof = _compute_asof(created_at)
 
-    score_entry = {
-        "lead_id": lead_str,
-        "asof": asof.isoformat(),
-        "probability": float(calibrated_probability[0]),
-        "band": bands[0],
-        "reasons": reasons,
-        "model_version": bundle["version"],
+def _db_entry(r: dict[str, Any]) -> dict[str, Any]:
+    """Strip a scored result down to the lead_scores columns."""
+    return {
+        "lead_id": r["lead_id"],
+        "asof": r["asof"],
+        "model_version": r["model_version"],
+        "probability": r["probability"],
+        "band": r["band"],
+        "reasons": r["reasons"],
     }
 
-    # Persist to database
+
+def _resolve_and_persist(results: list[dict[str, Any]]) -> None:
+    """
+    Resolve duplicate cluster sizes synchronously (plain SELECT, ~150ms)
+    and hand the INSERT to the background writer (commit latency dominates
+    on Neon). Best-effort: scoring never fails over persistence.
+    """
+    if not results:
+        return
     try:
-        append_lead_scores([score_entry])
+        sizes = lookup_sizes([r["lead_id"] for r in results])
+        for r in results:
+            r["duplicate_cluster_size"] = sizes.get(r["lead_id"], 1)
     except Exception:
         pass
+    enqueue_scores([_db_entry(r) for r in results])
 
-    return {
-        "lead_id": lead_str,
-        "asof": asof.isoformat(),
-        "probability": float(calibrated_probability[0]),
-        "band": bands[0],
-        "reasons": reasons,
-        "model_version": bundle["version"],
-        "duplicate_cluster_size": cluster_size,
-    }
+
+def score_single_lead(lead_id: str) -> dict[str, Any]:
+    """Score a single enquiry and return the response dict."""
+    _ensure_schema_once()
+    bundle = _get_bundle()
+    frames = _get_frames()
+
+    lead_str = str(lead_id)
+    if lead_str not in set(frames["leads"]["lead_id"].astype(str)):
+        raise HTTPException(status_code=404, detail=f"Lead {lead_id} not found")
+
+    mask = frames["leads"]["lead_id"].astype(str) == lead_str
+    leads_filtered = frames["leads"][mask]
+    messages_filtered = frames["messages"][
+        frames["messages"]["lead_id"].astype(str) == lead_str
+    ]
+    calls_filtered = frames["calls"][
+        frames["calls"]["lead_id"].astype(str) == lead_str
+    ]
+
+    try:
+        X = build_feature_matrix(
+            leads_df=leads_filtered,
+            messages_df=messages_filtered,
+            calls_df=calls_filtered,
+            localities_df=frames["localities"],
+            m4_features=_get_m4_features(frames["leads"]),
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    if X.empty:
+        raise HTTPException(status_code=404, detail=f"No features for lead {lead_id}")
+
+    t0 = time.perf_counter()
+    result = _score_frame(X, leads_filtered, bundle)[0]
+    t_score = time.perf_counter() - t0
+    t0 = time.perf_counter()
+    _resolve_and_persist([result])
+    t_db = time.perf_counter() - t0
+    _api_log.info(
+        "single %s score=%.2fs db=%.2fs", lead_str, t_score, t_db
+    )
+    return result
+
+
+def score_many_leads(lead_ids: list[str]) -> list[dict[str, Any]]:
+    """
+    Score many enquiries in one vectorized pass.
+
+    Same outputs as calling :func:`score_single_lead` per id, but the
+    feature matrix is built once, the model predicts once, SHAP runs once
+    over the batch, cluster sizes resolve in one query, and all rows are
+    appended in one transaction.
+    """
+    _ensure_schema_once()
+    bundle = _get_bundle()
+    frames = _get_frames()
+
+    requested = [str(lid) for lid in lead_ids]
+    known = set(frames["leads"]["lead_id"].astype(str))
+    for lid in requested:
+        if lid not in known:
+            raise HTTPException(status_code=404, detail=f"Lead {lid} not found")
+
+    # Score each unique lead once, then map back to request order.
+    unique_ids = list(dict.fromkeys(requested))
+    leads_mask = frames["leads"]["lead_id"].astype(str).isin(unique_ids)
+    leads_filtered = frames["leads"][leads_mask]
+    messages_filtered = frames["messages"][
+        frames["messages"]["lead_id"].astype(str).isin(unique_ids)
+    ]
+    calls_filtered = frames["calls"][
+        frames["calls"]["lead_id"].astype(str).isin(unique_ids)
+    ]
+
+    t0 = time.perf_counter()
+    try:
+        X = build_feature_matrix(
+            leads_df=leads_filtered,
+            messages_df=messages_filtered,
+            calls_df=calls_filtered,
+            localities_df=frames["localities"],
+            m4_features=_get_m4_features(frames["leads"]),
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    t_features = time.perf_counter() - t0
+
+    if X.empty:
+        raise HTTPException(status_code=404, detail="No features for requested leads")
+
+    t0 = time.perf_counter()
+    scored = _score_frame(X, leads_filtered, bundle)
+    t_score = time.perf_counter() - t0
+    by_id = {r["lead_id"]: r for r in scored}
+    results = [by_id[lid] for lid in requested]
+    t0 = time.perf_counter()
+    _resolve_and_persist(results)
+    t_db = time.perf_counter() - t0
+    _api_log.info(
+        "batch n=%d features=%.2fs score=%.2fs db=%.2fs",
+        len(unique_ids),
+        t_features,
+        t_score,
+        t_db,
+    )
+    return results
 
 
 def get_model_card_api() -> dict[str, Any]:
     """Get the model card from the database."""
-    initialise_schema()
+    _ensure_schema_once()
     card = get_model_card()
     if card is None:
         raise HTTPException(status_code=404, detail="No model registered")
@@ -258,7 +383,7 @@ def get_model_card_api() -> dict[str, Any]:
 def healthz_api() -> dict[str, Any]:
     """Health check including model loaded status."""
     try:
-        initialise_schema()
+        _ensure_schema_once()
         champion = get_champion_version()
         return {
             "status": "ok",

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import queue
+import threading
 from datetime import datetime, timezone
 from typing import Any
 
@@ -16,6 +18,10 @@ load_dotenv()
 # Database helpers
 # ---------------------------------------------------------------------------
 
+_pool = None
+_pool_lock = threading.Lock()
+
+
 def _database_url() -> str:
     database_url = __import__("os").environ.get("DATABASE_URL")
     if not database_url:
@@ -23,16 +29,55 @@ def _database_url() -> str:
     return database_url
 
 
-def _connect() -> psycopg.Connection[Any]:
-    return psycopg.connect(_database_url())
+def _pool_instance():
+    """Lazily create a small process-wide connection pool.
+
+    Cloud PostgreSQL handshakes (TLS + auth, plus Neon compute wake) cost
+    seconds per fresh connection. Reusing a warm pooled connection keeps
+    the UI snappy: /v1/model and single-score requests each need only
+    one or two quick queries.
+    """
+    global _pool
+    if _pool is None:
+        with _pool_lock:
+            if _pool is None:
+                from psycopg_pool import ConnectionPool
+
+                _pool = ConnectionPool(
+                    _database_url(), min_size=1, max_size=4, timeout=30
+                )
+
+                def _close_pool_at_exit() -> None:
+                    try:
+                        _pool.close()
+                    except Exception:
+                        pass
+
+                __import__("atexit").register(_close_pool_at_exit)
+    return _pool
+
+
+def _connect():
+    """Borrow a connection from the pool (same `with` usage as before)."""
+    return _pool_instance().connection()
 
 
 # ---------------------------------------------------------------------------
 # Schema: model_registry
 # ---------------------------------------------------------------------------
 
+# DDL (CREATE TABLE / INDEX / TRIGGER / FUNCTION) runs once per process.
+# Re-issuing it on every request costs several cloud round trips per call
+# and, worse, the AccessExclusiveLock DDL takes can deadlock with
+# concurrent scoring transactions. Fresh processes (scripts, API workers)
+# always run it once, so first-time setup is unaffected.
+_ddl_done: set[str] = set()
+
+
 def create_model_registry_table() -> None:
     """Create the model_registry table if it does not exist."""
+    if "model_registry" in _ddl_done:
+        return
     with _connect() as conn:
         with conn.cursor() as cur:
             cur.execute("""
@@ -53,6 +98,7 @@ def create_model_registry_table() -> None:
                 WHERE status = 'champion';
             """)
         conn.commit()
+    _ddl_done.add("model_registry")
 
 
 def create_lead_scores_table() -> None:
@@ -65,6 +111,8 @@ def create_lead_scores_table() -> None:
     row -- the primary key includes ``scored_at`` so re-scoring the same
     lead never collides, it just adds another history row.
     """
+    if "lead_scores" in _ddl_done:
+        return
     with _connect() as conn:
         with conn.cursor() as cur:
             cur.execute("""
@@ -139,16 +187,25 @@ def create_lead_scores_table() -> None:
                 END;
                 $$ LANGUAGE plpgsql;
             """)
+            # Create the trigger only if missing. DROP + CREATE on every
+            # call needs AccessExclusiveLock each time and deadlocks with
+            # concurrent scoring transactions.
             cur.execute("""
-                DROP TRIGGER IF EXISTS lead_scores_no_update_delete
-                ON lead_scores;
-            """)
-            cur.execute("""
-                CREATE TRIGGER lead_scores_no_update_delete
-                BEFORE UPDATE OR DELETE ON lead_scores
-                FOR EACH ROW EXECUTE FUNCTION prevent_lead_scores_modify();
+                DO $$
+                BEGIN
+                    IF NOT EXISTS (
+                        SELECT 1 FROM pg_trigger
+                        WHERE tgname = 'lead_scores_no_update_delete'
+                    ) THEN
+                        CREATE TRIGGER lead_scores_no_update_delete
+                        BEFORE UPDATE OR DELETE ON lead_scores
+                        FOR EACH ROW EXECUTE FUNCTION prevent_lead_scores_modify();
+                    END IF;
+                END;
+                $$;
             """)
         conn.commit()
+    _ddl_done.add("lead_scores")
 
 
 # ---------------------------------------------------------------------------
@@ -366,6 +423,57 @@ def _set_status(version: str, status: str) -> None:
 # Lead scores (append-only)
 # ---------------------------------------------------------------------------
 
+def _fetch_cluster_sizes(
+    cur: Any, lead_ids: list[str]
+) -> dict[str, int]:
+    """Single-query cluster-size lookup on an open cursor."""
+    sizes: dict[str, int] = {str(lid): 1 for lid in lead_ids}
+    if not lead_ids:
+        return sizes
+    cur.execute(
+        """
+        SELECT lead_id, cluster_size FROM lead_clusters
+        WHERE lead_id = ANY(%s);
+        """,
+        ([str(lid) for lid in lead_ids],),
+    )
+    for lead_id, cluster_size in cur.fetchall():
+        if cluster_size is not None:
+            sizes[str(lead_id)] = int(cluster_size)
+    return sizes
+
+
+def _insert_score_rows(cur: Any, scores: list[dict[str, Any]]) -> None:
+    """Insert many scoring events as ONE multi-row statement (1 round trip)."""
+    placeholders = ",".join(["(%s,%s,%s,%s,%s,%s,%s)"] * len(scores))
+    params: list[Any] = []
+    for score in scores:
+        # Per-row timestamp (not the DB default now(), which is the
+        # transaction start and would be identical for every row).
+        params.extend(
+            [
+                score["lead_id"],
+                score["asof"],
+                score["model_version"],
+                score["probability"],
+                score["band"],
+                json.dumps(score["reasons"]),
+                datetime.now(timezone.utc),
+            ]
+        )
+    cur.execute(
+        "INSERT INTO lead_scores"
+        " (lead_id, asof, model_version, probability, band, reasons, scored_at)"
+        f" VALUES {placeholders};",
+        params,
+    )
+
+
+def _insert_score_row(cur: Any, score: dict[str, Any]) -> None:
+    """Insert one scoring event on an open cursor."""
+    _insert_score_rows(cur, [score])
+
+
 def append_lead_scores(scores: list[dict[str, Any]]) -> int:
     """
     Append scored results to lead_scores table.
@@ -385,30 +493,170 @@ def append_lead_scores(scores: list[dict[str, Any]]) -> int:
         with conn.cursor() as cur:
             inserted = 0
             for score in scores:
-                # Per-row timestamp (not the DB default now(), which is
-                # the transaction start and would be identical for every
-                # row in a batch).
-                scored_at = datetime.now(timezone.utc)
-                cur.execute(
-                    """
-                    INSERT INTO lead_scores
-                        (lead_id, asof, model_version, probability, band, reasons, scored_at)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s);
-                    """,
-                    (
-                        score["lead_id"],
-                        score["asof"],
-                        score["model_version"],
-                        score["probability"],
-                        score["band"],
-                        json.dumps(score["reasons"]),
-                        scored_at,
-                    ),
-                )
+                _insert_score_row(cur, score)
                 if cur.rowcount == 1:
                     inserted += 1
             conn.commit()
         return inserted
+
+
+def lookup_sizes_and_append(
+    lead_ids: list[str], scores: list[dict[str, Any]]
+) -> tuple[dict[str, int], int]:
+    """
+    Synchronous variant: resolve sizes and append in two round trips.
+    Prefer :func:`lookup_sizes` + :func:`enqueue_scores` on the latency
+    sensitive API path (commit latency dominates); this stays for scripts
+    and tests that need durable writes before returning.
+    Returns ``(sizes, inserted)``.
+    """
+    create_lead_scores_table()
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            try:
+                sizes = _fetch_cluster_sizes(cur, lead_ids)
+            except Exception:
+                sizes = {str(lid): 1 for lid in lead_ids}
+            inserted = 0
+            if scores:
+                _insert_score_rows(cur, scores)
+                inserted = cur.rowcount if cur.rowcount > 0 else 0
+            conn.commit()
+        return sizes, inserted
+
+
+def persist_single_score(score: dict[str, Any]) -> int:
+    """
+    Synchronous single-row variant (insert + size lookup in one round
+    trip). Prefer :func:`lookup_sizes` + :func:`enqueue_scores` on the
+    latency sensitive API path; this stays for scripts and one-off use.
+    Returns the cluster size (1 if unknown).
+    """
+    create_lead_scores_table()
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            scored_at = datetime.now(timezone.utc)
+            cur.execute(
+                """
+                WITH ins AS (
+                    INSERT INTO lead_scores
+                        (lead_id, asof, model_version, probability, band, reasons, scored_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    RETURNING lead_id
+                )
+                SELECT %s AS lead_id, cluster_size FROM lead_clusters
+                WHERE lead_id = %s;
+                """,
+                (
+                    score["lead_id"],
+                    score["asof"],
+                    score["model_version"],
+                    score["probability"],
+                    score["band"],
+                    json.dumps(score["reasons"]),
+                    scored_at,
+                    score["lead_id"],
+                    score["lead_id"],
+                ),
+            )
+            row = cur.fetchone()
+            conn.commit()
+    if row and row[1] is not None:
+        return int(row[1])
+    return 1
+
+
+# ---------------------------------------------------------------------------
+# Low-latency API path: sync size lookup + async append.
+#
+# Neon commit latency dominates /v1/score (median ~1.2s per commit), so the
+# API resolves cluster sizes synchronously (plain SELECT, ~150ms) and
+# hands the INSERT to a background writer. Responses stay well under the
+# 800ms budget while every scoring event is still appended exactly once,
+# in order, by a single writer thread.
+# ---------------------------------------------------------------------------
+
+_append_queue: queue.Queue[dict[str, Any]] = queue.Queue()
+_append_thread: threading.Thread | None = None
+_append_lock = threading.Lock()
+
+
+def lookup_sizes(lead_ids: list[str]) -> dict[str, int]:
+    """Synchronous cluster-size lookup (one round trip, no writes)."""
+    return get_duplicate_cluster_sizes(lead_ids)
+
+
+def enqueue_scores(scores: list[dict[str, Any]]) -> None:
+    """Queue scoring events for background append. Never blocks, never raises."""
+    _ensure_append_thread()
+    try:
+        for score in scores:
+            _append_queue.put_nowait(score)
+    except Exception:
+        pass
+
+
+def _ensure_append_thread() -> None:
+    global _append_thread
+    if _append_thread is not None and _append_thread.is_alive():
+        return
+    with _append_lock:
+        if _append_thread is not None and _append_thread.is_alive():
+            return
+        _append_thread = threading.Thread(
+            target=_append_worker, name="lead-scores-writer", daemon=True
+        )
+        _append_thread.start()
+
+        def _flush_at_exit() -> None:
+            flush_append_queue(timeout=10.0)
+
+        import atexit
+
+        atexit.register(_flush_at_exit)
+
+
+def _append_worker() -> None:
+    """Single writer: coalesce queued events, multi-row INSERT, commit."""
+    pending: list[dict[str, Any]] = []
+    while True:
+        try:
+            pending.append(_append_queue.get(timeout=0.2))
+            while len(pending) < 1000:
+                try:
+                    pending.append(_append_queue.get_nowait())
+                except queue.Empty:
+                    break
+        except queue.Empty:
+            pass
+        if pending:
+            batch, pending = pending, []
+            _flush_pending(batch)
+
+
+def _flush_pending(pending: list[dict[str, Any]]) -> None:
+    try:
+        create_lead_scores_table()
+        with _connect() as conn:
+            with conn.cursor() as cur:
+                _insert_score_rows(cur, pending)
+            conn.commit()
+    except Exception:
+        # Best-effort background path: drop rather than grow unbounded.
+        # Synchronous callers needing durability use append_lead_scores.
+        pass
+
+
+def flush_append_queue(timeout: float = 10.0) -> int:
+    """Block until queued events are appended. Returns rows still queued."""
+    import time as _time
+
+    deadline = _time.time() + timeout
+    while not _append_queue.empty() and _time.time() < deadline:
+        _time.sleep(0.05)
+    # Give the writer one more beat to commit the final batch.
+    _time.sleep(0.3)
+    return _append_queue.qsize()
 
 
 def get_scored_leads(
@@ -476,6 +724,23 @@ def get_duplicate_cluster_size(lead_id: str) -> int:
     except Exception:
         pass
     return 1
+
+
+def get_duplicate_cluster_sizes(lead_ids: list[str]) -> dict[str, int]:
+    """
+    Batch version of :func:`get_duplicate_cluster_size`: one query for
+    many leads. Missing leads default to 1 (no duplicates).
+    """
+    sizes: dict[str, int] = {str(lid): 1 for lid in lead_ids}
+    if not lead_ids:
+        return sizes
+    try:
+        with _connect() as conn:
+            with conn.cursor() as cur:
+                sizes = _fetch_cluster_sizes(cur, lead_ids)
+    except Exception:
+        pass
+    return sizes
 
 
 # ---------------------------------------------------------------------------

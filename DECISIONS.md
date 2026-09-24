@@ -12,3 +12,25 @@
 * **Training Window:** [e.g., 2025-01-01 to 2025-10-31]
 * **Validation Window:** [e.g., 2025-11-01 to 2025-12-15]
 * **Calibration Window:** [e.g., 2025-12-16 to 2025-12-31]
+
+## Training unit and label
+
+We train the conversion model at the enquiry level.
+
+Each `lead_id` remains a separate modeling observation, even when
+M4 identifies multiple lead records as belonging to the same person.
+
+Therefore the target remains an enquiry-level binary target:
+
+- `1`: this enquiry reaches `Admission Done` within 30 days of creation.
+- `0`: this enquiry does not reach `Admission Done` within 30 days.
+
+M4 deduplication does not change the target or collapse duplicate
+enquiries into one training row. Instead, it is used to derive
+`earlier_enquiries_count` as an M1 feature.
+
+If training were performed at the person level, multiple enquiries
+belonging to the same M4 cluster would instead be represented as a
+person-level observation, and the target would have to be defined as
+a person-level outcome rather than the outcome of an individual
+enquiry. We do not use that training unit in the production model.
